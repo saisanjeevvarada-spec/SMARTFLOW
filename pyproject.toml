@@ -1,0 +1,23 @@
+[tool.pyright]
+include = ["backend"]
+venvPath = "backend"
+venv = "venv_win"
+extraPaths = [
+  "backend/venv_win/Lib/site-packages",
+  "backend/venv/Lib/site-packages",
+  "C:/Users/SAI SANJEEV VARADA/OneDrive/Desktop/project s/smartflow_poject/smartflow/smartflow/backend/venv_win/Lib/site-packages",
+  "C:/Users/SAI SANJEEV VARADA/OneDrive/Desktop/project s/smartflow_poject/smartflow/smartflow/backend/venv/Lib/site-packages",
+  "."
+]
+
+[tool.pyrefly]
+search_paths = [
+  "backend/venv_win/Lib/site-packages",
+  "backend/venv/Lib/site-packages",
+  "C:/Users/SAI SANJEEV VARADA/OneDrive/Desktop/project s/smartflow_poject/smartflow/smartflow/backend/venv_win/Lib/site-packages",
+  "C:/Users/SAI SANJEEV VARADA/OneDrive/Desktop/project s/smartflow_poject/smartflow/smartflow/backend/venv/Lib/site-packages",
+  "."
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

@@ -1,0 +1,292 @@
+import re
+import uuid
+import logging
+from datetime import datetime, timedelta
+from flask import Blueprint, request, jsonify
+from flask_jwt_extended import create_access_token, create_refresh_token, jwt_required, get_jwt_identity
+from backend.extensions import db
+from backend.models.user import User
+from backend.schemas.user import UserSchema, UserLoginSchema, UserProfileUpdateSchema
+from backend.services.google_service import verify_google_token, is_google_auth_configured
+from marshmallow import ValidationError
+
+logger = logging.getLogger(__name__)
+
+auth_bp = Blueprint('auth', __name__, url_prefix='/auth')
+
+user_schema = UserSchema()
+login_schema = UserLoginSchema()
+profile_update_schema = UserProfileUpdateSchema()
+
+ALLOWED_PROFILE_FIELDS = {'name', 'phone', 'address', 'email'}
+
+def validate_password_strength(password):
+    if len(password) < 8:
+        return False, "Password must be at least 8 characters long."
+    if not re.search(r"[A-Z]", password):
+        return False, "Password must contain at least one uppercase letter."
+    if not re.search(r"[a-z]", password):
+        return False, "Password must contain at least one lowercase letter."
+    if not re.search(r"\d", password):
+        return False, "Password must contain at least one digit."
+    if not re.search(r"[!@#$%^&*(),.?\":{}|<>]", password):
+        return False, "Password must contain at least one special character."
+    return True, ""
+
+@auth_bp.route('/register', methods=['POST'])
+def register():
+    try:
+        data = request.get_json() or {}
+        validated_data = user_schema.load(data)
+        
+        # Check if user already exists
+        if User.query.filter_by(email=validated_data['email']).first():
+            return jsonify({"error": "User with this email already exists"}), 400
+            
+        password = validated_data.pop('password')
+        
+        # Validate password strength
+        is_valid, err_msg = validate_password_strength(password)
+        if not is_valid:
+            return jsonify({"error": err_msg}), 400
+            
+        new_user = User(**validated_data)
+        new_user.set_password(password)
+        
+        db.session.add(new_user)
+        db.session.commit()
+        
+        return jsonify({"success": True, "user": new_user.to_dict()}), 201
+    except ValidationError as err:
+        return jsonify({"errors": err.messages}), 400
+    except Exception as e:
+        logger.exception("Error in register endpoint: %s", e)
+        db.session.rollback()
+        return jsonify({"error": "An internal server error occurred"}), 500
+
+@auth_bp.route('/login', methods=['POST'])
+def login():
+    try:
+        data = request.get_json() or {}
+        validated_data = login_schema.load(data)
+        
+        user = User.query.filter_by(email=validated_data['email']).first()
+        if not user or not user.check_password(validated_data['password']):
+            return jsonify({"error": "Invalid email or password"}), 401
+            
+        access_token = create_access_token(identity=str(user.id))
+        refresh_token = create_refresh_token(identity=str(user.id))
+        
+        return jsonify({
+            "success": True,
+            "token": access_token,
+            "refreshToken": refresh_token,
+            "user": user.to_dict()
+        }), 200
+    except ValidationError as err:
+        return jsonify({"errors": err.messages}), 400
+    except Exception as e:
+        logger.exception("Error in login endpoint: %s", e)
+        return jsonify({"error": "An internal server error occurred"}), 500
+
+@auth_bp.route('/profile', methods=['PUT'])
+@jwt_required()
+def update_profile():
+    try:
+        identity = get_jwt_identity()
+        user_id = int(identity) if str(identity).isdigit() else None
+        user = db.session.get(User, user_id) if user_id else User.query.filter_by(email=identity).first()
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+            
+        data = request.get_json() or {}
+        validated_data = profile_update_schema.load(data)
+        
+        # If updating password
+        if 'password' in validated_data:
+            new_pass = validated_data['password']
+            is_valid, err_msg = validate_password_strength(new_pass)
+            if not is_valid:
+                return jsonify({"error": err_msg}), 400
+            user.set_password(new_pass)
+            
+        # Update allowed profile fields explicitly (role modifications are strictly prevented)
+        for key in ALLOWED_PROFILE_FIELDS:
+            if key in validated_data and validated_data[key] is not None:
+                setattr(user, key, validated_data[key])
+                    
+        db.session.commit()
+        
+        return jsonify({
+            "success": True,
+            "user": user.to_dict()
+        }), 200
+    except ValidationError as err:
+        return jsonify({"errors": err.messages}), 400
+    except Exception as e:
+        logger.exception("Error in update_profile endpoint: %s", e)
+        db.session.rollback()
+        return jsonify({"error": "An internal server error occurred"}), 500
+
+@auth_bp.route('/forgot-password', methods=['POST'])
+def forgot_password():
+    try:
+        data = request.get_json() or {}
+        email = data.get('email')
+        if not email:
+            return jsonify({"error": "Email is required"}), 400
+            
+        user = User.query.filter_by(email=email).first()
+        if not user:
+            # Standard security practice: return success anyway to prevent user enumeration
+            return jsonify({"success": True, "message": "If this email exists in our records, a recovery code has been sent."}), 200
+            
+        token = str(uuid.uuid4().hex[:6]).upper()
+        user.reset_token = token
+        user.reset_token_expiry = datetime.utcnow() + timedelta(minutes=15)
+        db.session.commit()
+        
+        logger.info("Generated password reset code for user %s", email)
+        
+        return jsonify({
+            "success": True, 
+            "message": "If this email exists in our records, a recovery code has been sent."
+        }), 200
+    except Exception as e:
+        logger.exception("Error in forgot_password endpoint: %s", e)
+        db.session.rollback()
+        return jsonify({"error": "An internal server error occurred"}), 500
+
+@auth_bp.route('/reset-password', methods=['POST'])
+def reset_password():
+    try:
+        data = request.get_json() or {}
+        token = data.get('token')
+        new_password = data.get('password')
+        
+        if not token or not new_password:
+            return jsonify({"error": "Reset token and new password are required"}), 400
+            
+        user = User.query.filter_by(reset_token=token).first()
+        if not user or not user.reset_token_expiry or user.reset_token_expiry < datetime.utcnow():
+            return jsonify({"error": "Invalid or expired reset token"}), 400
+            
+        is_valid, err_msg = validate_password_strength(new_password)
+        if not is_valid:
+            return jsonify({"error": err_msg}), 400
+            
+        user.set_password(new_password)
+        user.reset_token = None
+        user.reset_token_expiry = None
+        db.session.commit()
+        
+        return jsonify({"success": True, "message": "Password has been successfully reset"}), 200
+    except Exception as e:
+        logger.exception("Error in reset_password endpoint: %s", e)
+        db.session.rollback()
+        return jsonify({"error": "An internal server error occurred"}), 500
+
+@auth_bp.route('/google-signup', methods=['POST'])
+def google_signup():
+    if not is_google_auth_configured():
+        return jsonify({"error": "Google authentication is not configured."}), 400
+
+    try:
+        data = request.get_json() or {}
+        token = data.get('credential') or data.get('idToken') or data.get('token')
+        
+        if not token:
+            return jsonify({"error": "Google authentication failed. Please try again."}), 400
+            
+        success, error_msg, payload = verify_google_token(token)
+        if not success or not payload:
+            return jsonify({"error": error_msg or "Google authentication failed. Please try again."}), 400
+            
+        google_id = payload.get('sub')
+        email = payload.get('email', '').lower().strip()
+        name = payload.get('name') or email.split('@')[0]
+        picture = payload.get('picture')
+        
+        user = User.query.filter_by(email=email).first()
+        if user:
+            return jsonify({"error": "This Google account is already registered. Please sign in instead."}), 400
+            
+        new_user = User(
+            name=name,
+            email=email,
+            google_id=google_id,
+            provider='google',
+            profile_picture=picture,
+            role='Cashier',
+            password_hash=None
+        )
+        
+        db.session.add(new_user)
+        db.session.commit()
+        
+        access_token = create_access_token(identity=str(new_user.id))
+        refresh_token = create_refresh_token(identity=str(new_user.id))
+        
+        return jsonify({
+            "success": True,
+            "token": access_token,
+            "refreshToken": refresh_token,
+            "user": new_user.to_dict()
+        }), 201
+    except Exception as e:
+        logger.exception("Error in google_signup endpoint: %s", e)
+        db.session.rollback()
+        return jsonify({"error": "Google authentication failed. Please try again."}), 400
+
+@auth_bp.route('/google-login', methods=['POST'])
+@auth_bp.route('/google', methods=['POST'])
+def google_login():
+    if not is_google_auth_configured():
+        return jsonify({"error": "Google authentication is not configured."}), 400
+
+    try:
+        data = request.get_json() or {}
+        token = data.get('credential') or data.get('idToken') or data.get('token')
+        
+        if not token:
+            return jsonify({"error": "Google authentication failed. Please try again."}), 400
+            
+        success, error_msg, payload = verify_google_token(token)
+        if not success or not payload:
+            return jsonify({"error": error_msg or "Google authentication failed. Please try again."}), 400
+            
+        google_id = payload.get('sub')
+        email = payload.get('email', '').lower().strip()
+        picture = payload.get('picture')
+        
+        user = User.query.filter_by(email=email).first()
+        if not user:
+            return jsonify({"error": "No account exists with this Google email. Please create an account first."}), 400
+            
+        if not user.google_id:
+            user.google_id = google_id
+            user.provider = 'google'
+        if picture and not user.profile_picture:
+            user.profile_picture = picture
+        db.session.commit()
+            
+        access_token = create_access_token(identity=str(user.id))
+        refresh_token = create_refresh_token(identity=str(user.id))
+        
+        return jsonify({
+            "success": True,
+            "token": access_token,
+            "refreshToken": refresh_token,
+            "user": user.to_dict()
+        }), 200
+    except Exception as e:
+        logger.exception("Error in google_login endpoint: %s", e)
+        db.session.rollback()
+        return jsonify({"error": "Google authentication failed. Please try again."}), 400
+
+@auth_bp.route('/refresh', methods=['POST'])
+@jwt_required(refresh=True)
+def refresh():
+    identity = get_jwt_identity()
+    new_access_token = create_access_token(identity=identity)
+    return jsonify({"token": new_access_token}), 200

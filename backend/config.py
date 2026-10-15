@@ -9,10 +9,26 @@ class Config:
     SECRET_KEY = os.environ.get('SECRET_KEY', 'smartflow-secret-key-fallback')
     
     # Supabase / Managed Postgres URI normalization
-    db_uri = os.environ.get('DATABASE_URL', 'postgresql://localhost:5432/smartflow')
+    db_uri = os.environ.get(
+        'DATABASE_URL',
+        'postgresql://localhost:5432/smartflow'
+    )
+
     if db_uri.startswith("postgres://"):
-        db_uri = db_uri.replace("postgres://", "postgresql://", 1)
+        db_uri = db_uri.replace(
+            "postgres://",
+            "postgresql+psycopg2://",
+            1
+        )
+    elif db_uri.startswith("postgresql://"):
+        db_uri = db_uri.replace(
+            "postgresql://",
+            "postgresql+psycopg2://",
+            1
+        )
+
     SQLALCHEMY_DATABASE_URI = db_uri
+
     
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     
